@@ -1,0 +1,72 @@
+# Copy to mlxctl.toml and fill in your machines. Do not commit mlxctl.toml.
+cluster_id = "mlx-mesh"
+token = "CHANGE_ME"
+
+python = "/Users/USER/mlx-env/bin/python"
+mlx_launch = "/Users/USER/mlx-env/bin/mlx.launch"
+hostfile = "/Users/USER/mlx-cluster/jaccl-mesh.json"
+setup_tb = "/Users/USER/mlx-cluster/setup-tb.sh"
+serve_entry = "/Users/USER/mlx-cluster/serve_entry.py"
+cluster_dir = "/Users/USER/mlx-cluster"
+log_dir = "/Users/USER/mlx-cluster/logs"
+state_path = "/Users/USER/mlx-cluster/mlxctl-state.json"
+model_roots = ["/Users/USER/.exo/models"]
+
+controller_bind = "0.0.0.0:9090"
+agent_bind = "0.0.0.0:9091"
+internal_infer_port = 18088
+
+[endpoint]
+advertise_host = "10.0.0.1"
+bind = "0.0.0.0"
+port = 8088
+api_key = ""
+enabled = true
+
+[[nodes]]
+name = "node0"
+ssh = "10.0.0.1"
+rank = 0
+memory_gb = 128
+rdma = ["", "rdma_en3", "rdma_en5", "rdma_en4"]
+links = [
+  { iface = "en3", ip = "10.0.1.1", peer = "10.0.1.2", peer_name = "node1" },
+  { iface = "en5", ip = "10.0.1.5", peer = "10.0.1.6", peer_name = "node2" },
+  { iface = "en4", ip = "10.0.1.9", peer = "10.0.1.10", peer_name = "node3" },
+]
+
+[[nodes]]
+name = "node1"
+ssh = "10.0.0.2"
+rank = 1
+memory_gb = 64
+rdma = ["rdma_en3", "", "rdma_en4", "rdma_en5"]
+links = [
+  { iface = "en3", ip = "10.0.1.2", peer = "10.0.1.1", peer_name = "node0" },
+  { iface = "en4", ip = "10.0.1.13", peer = "10.0.1.14", peer_name = "node2" },
+  { iface = "en5", ip = "10.0.1.17", peer = "10.0.1.18", peer_name = "node3" },
+]
+
+[[nodes]]
+name = "node2"
+ssh = "10.0.0.3"
+rank = 2
+memory_gb = 64
+rdma = ["rdma_en5", "rdma_en3", "", "rdma_en4"]
+links = [
+  { iface = "en5", ip = "10.0.1.6", peer = "10.0.1.5", peer_name = "node0" },
+  { iface = "en3", ip = "10.0.1.14", peer = "10.0.1.13", peer_name = "node1" },
+  { iface = "en4", ip = "10.0.1.21", peer = "10.0.1.22", peer_name = "node3" },
+]
+
+[[nodes]]
+name = "node3"
+ssh = "10.0.0.4"
+rank = 3
+memory_gb = 64
+rdma = ["rdma_en4", "rdma_en5", "rdma_en3", ""]
+links = [
+  { iface = "en4", ip = "10.0.1.10", peer = "10.0.1.9", peer_name = "node0" },
+  { iface = "en5", ip = "10.0.1.18", peer = "10.0.1.17", peer_name = "node1" },
+  { iface = "en3", ip = "10.0.1.22", peer = "10.0.1.21", peer_name = "node2" },
+]

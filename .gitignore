@@ -1,0 +1,30 @@
+/target
+**/target
+**/node_modules
+mlxctl/web/dist
+**/.DS_Store
+logs/
+*.log
+
+# Local cluster identity — never commit
+mlxctl.toml
+mlxctl.toml.local
+jaccl-mesh.json
+jaccl-ring.json
+mlxctl-state.json
+
+# Secrets and keys
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519
+id_ecdsa
+mlxctl_sync
+**/.ssh/
+
+# Build artifacts
+*.dylib
+*.so
+*.o

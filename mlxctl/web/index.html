@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MLX-JACCL 控制台</title>
+  <link rel="stylesheet" href="/styles.css?v=sync" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">MLX · JACCL · Thunderbolt</p>
+      <h1 id="cluster-name">studio-mesh</h1>
+    </div>
+    <div class="top-status">
+      <span class="pill" id="serve-pill">stopped</span>
+      <button type="button" class="ghost" id="copy-url">复制 OpenAI</button>
+      <button type="button" class="ghost" id="copy-claude">复制 Claude</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button type="button" data-tab="cluster" class="on">集群</button>
+    <button type="button" data-tab="models">模型</button>
+    <button type="button" data-tab="chat">对话</button>
+    <button type="button" data-tab="endpoints">接口</button>
+    <button type="button" data-tab="logs">日志</button>
+  </nav>
+
+  <main>
+    <section id="tab-cluster" class="panel on">
+      <div class="toolbar">
+        <button type="button" id="btn-cluster-up">启动网络</button>
+        <button type="button" id="btn-serve-stop" class="danger">停止推理</button>
+        <p class="hint" id="mesh-hint">正在读取四台 Studio…</p>
+        <p class="hint" id="stack-hint"></p>
+      </div>
+      <div class="cards" id="nodes"></div>
+    </section>
+
+    <section id="tab-models" class="panel">
+      <div class="toolbar">
+        <input id="pull-repo" placeholder="mlx-community/Qwen3.5-27B-4bit" />
+        <button type="button" id="btn-pull">四台拉取</button>
+        <p class="hint" id="model-hint">一台下完后点「同步到四台」，经 Thunderbolt 复制到其余三台。四台都完整才能加载。</p>
+        <button type="button" id="btn-install-vlm" hidden>安装 mlx-vlm</button>
+      </div>
+      <div class="toolbar pull-row">
+        <span class="meta">快捷拉取</span>
+        <button type="button" class="pull-chip" data-repo="mlx-community/Qwen3.8-Flash-Next-4bit">Qwen3.8-Flash-Next-4bit</button>
+        <button type="button" class="pull-chip" data-repo="mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed">DeepSeek-V4-Flash-0731-2.4bit-mixed</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>模型</th>
+            <th>方案</th>
+            <th>体积</th>
+            <th>分布</th>
+            <th>说明</th>
+            <th>启动</th>
+          </tr>
+        </thead>
+        <tbody id="model-rows"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-chat" class="panel">
+      <div class="chat-head">
+        <p class="hint" id="chat-meta">尚未连接模型</p>
+        <p class="family-banner" id="chat-family" hidden></p>
+        <div class="chat-actions">
+          <label class="chat-lang">
+            回复
+            <select id="chat-lang" title="模型回复语言">
+              <option value="auto">自动</option>
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+            </select>
+          </label>
+          <label class="chat-lang chat-check" id="chat-think-wrap" hidden title="仅 DeepSeek-V4：在回复前使用 think 标签">
+            <input id="chat-think" type="checkbox" />
+            思考
+          </label>
+          <label class="chat-lang chat-check" id="chat-long-wrap" title="打开后允许更长回复">
+            <input id="chat-long" type="checkbox" />
+            超长补全
+          </label>
+          <label class="chat-lang">
+            max_tokens
+            <input id="chat-max-tokens" type="number" min="16" step="64" value="2048" />
+          </label>
+          <button type="button" id="chat-clear">清空</button>
+        </div>
+      </div>
+      <div class="chat-thread" id="chat-thread">
+        <p class="chat-empty" id="chat-empty">先在「模型」页加载，然后在这里直接跟后端模型对话。</p>
+      </div>
+      <div class="chat-previews" id="chat-previews" hidden></div>
+      <form class="chat-composer" id="chat-form">
+        <label class="chat-attach" id="chat-attach-wrap" hidden>
+          图片
+          <input id="chat-images" type="file" accept="image/*" multiple />
+        </label>
+        <textarea id="chat-input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea>
+        <button type="submit" id="chat-send" class="primary">发送</button>
+        <button type="button" id="chat-stop" hidden>停止</button>
+      </form>
+    </section>
+
+    <section id="tab-endpoints" class="panel">
+      <form id="endpoint-form" class="form">
+        <label>对外宣告地址
+          <input name="advertise_host" />
+        </label>
+        <label>监听网卡
+          <input name="bind" />
+        </label>
+        <label>端口
+          <input name="port" type="number" min="1" max="65535" />
+        </label>
+        <label>API Key（可空）
+          <input name="api_key" autocomplete="off" />
+        </label>
+        <label class="check">
+          <input name="enabled" type="checkbox" />
+          对局域网开放
+        </label>
+        <button type="submit">保存并发布</button>
+      </form>
+      <pre class="snippet" id="snippet"></pre>
+    </section>
+
+    <section id="tab-logs" class="panel">
+      <pre class="log" id="log-box">暂无日志</pre>
+    </section>
+  </main>
+
+  <p class="flash" id="flash" hidden></p>
+  <script type="module" src="/app.js?v=sync"></script>
+</body>
+</html>
