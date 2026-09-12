@@ -887,6 +887,24 @@ function renderPreviews() {
     .join("");
 }
 
+function contentHasImage(content) {
+  return Array.isArray(content) && content.some((p) => p?.type === "image_url");
+}
+
+function textOnlyContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content ?? "";
+  const texts = [];
+  let images = 0;
+  for (const part of content) {
+    if (part?.type === "text" && part.text) texts.push(part.text);
+    if (part?.type === "image_url") images += 1;
+  }
+  if (texts.length) return texts.join("\n");
+  if (images > 1) return `（${images} 张图片）`;
+  return images ? "（图片）" : "";
+}
+
 function historyForApi() {
   const msgs = chat.turns
     .filter((t) => t.role === "user" || (t.role === "assistant" && t.content))
@@ -896,6 +914,23 @@ function historyForApi() {
   if (prompt) sys.push(prompt);
   if (thinkingOn() && servingProfile()?.thinking) sys.push(CHAT_THINKING_PROMPT);
   if (sys.length) msgs.unshift({ role: "system", content: sys.join("\n") });
+
+  // Only the latest visual turn keeps pixels. Older images stay in the thread UI
+  // but are sent as text, otherwise a second upload re-answers the first photo.
+  let keepImagesAt = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === "user" && contentHasImage(msgs[i].content)) {
+      keepImagesAt = i;
+      break;
+    }
+  }
+  if (keepImagesAt >= 0) {
+    for (let i = 0; i < msgs.length; i++) {
+      if (i !== keepImagesAt && contentHasImage(msgs[i].content)) {
+        msgs[i] = { ...msgs[i], content: textOnlyContent(msgs[i].content) };
+      }
+    }
+  }
   return msgs;
 }
 
