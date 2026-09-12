@@ -44,6 +44,9 @@ pub fn cleanup_serve_processes(serve_entry: Option<&Path>) {
     let _ = Command::new("/usr/bin/pkill")
         .args(["-f", "mlx_vlm.server.cli"])
         .status();
+    let _ = Command::new("/usr/bin/pkill")
+        .args(["-f", "mlx.launch"])
+        .status();
 }
 
 pub fn spawn_launch(
@@ -87,8 +90,11 @@ pub fn spawn_launch(
         .arg(format!("MLXCTL_RUNTIME={runtime}"))
         .arg("--env")
         .arg("MLX_DISTRIBUTED_BACKEND=jaccl")
+        .arg("--env")
+        .arg("PYTHONUNBUFFERED=1")
         .arg("--")
         .arg(&cfg.python)
+        .arg("-u")
         .arg(&cfg.serve_entry)
         .arg("--model")
         .arg(model_path)
@@ -97,8 +103,11 @@ pub fn spawn_launch(
         .arg("--port")
         .arg(&port)
         .arg("--log-level")
-        .arg("INFO")
-        .current_dir(&cfg.cluster_dir)
+        .arg("INFO");
+    if runtime == "mlx_vlm" {
+        cmd.arg("--trust-remote-code");
+    }
+    cmd.current_dir(&cfg.cluster_dir)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2))
         .process_group(0);
@@ -111,13 +120,39 @@ pub fn spawn_launch(
     Ok(pid)
 }
 
-pub async fn wait_ready(port: u16, timeout: Duration) -> Result<()> {
+pub async fn wait_port_free(port: u16, timeout: Duration) -> Result<()> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let start = tokio::time::Instant::now();
+    loop {
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                drop(listener);
+                return Ok(());
+            }
+            Err(_) => {
+                if start.elapsed() > timeout {
+                    bail!("port {port} still in use after unloading the previous model");
+                }
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+pub async fn wait_ready(port: u16, timeout: Duration, pid: Option<u32>) -> Result<()> {
     let url = format!("http://127.0.0.1:{port}/v1/models");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
     let start = tokio::time::Instant::now();
     loop {
+        if let Some(p) = pid {
+            if !pid_alive(p) {
+                bail!(
+                    "model server process {p} exited before becoming ready; see logs/serve.log"
+                );
+            }
+        }
         if start.elapsed() > timeout {
             bail!("model server did not become ready on {url}");
         }
@@ -138,4 +173,20 @@ pub fn tail_log(path: &std::path::Path, max_bytes: usize) -> String {
         return String::from_utf8_lossy(&data).to_string();
     }
     String::from_utf8_lossy(&data[data.len() - max_bytes..]).to_string()
+}
+
+pub fn clear_log(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    let marker = format!(
+        "==== mlxctl logs cleared {} ====\n",
+        chrono::Local::now().to_rfc3339()
+    );
+    file.write_all(marker.as_bytes())?;
+    file.flush()?;
+    Ok(())
 }

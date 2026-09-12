@@ -204,6 +204,11 @@ fn user_plist(
     <key>PATH</key>
     <string>{path_env}</string>
   </dict>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>65536</integer>
+  </dict>
 </dict>
 </plist>
 "#,

@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    raise_nofile(65536);
     let config_path = cli
         .config
         .unwrap_or_else(|| config::home_dir().join("mlx-cluster/mlxctl.toml"));
@@ -81,4 +82,26 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn raise_nofile(target: u64) {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let want = if lim.rlim_max == libc::RLIM_INFINITY {
+            target
+        } else {
+            target.min(lim.rlim_max as u64)
+        };
+        if (lim.rlim_cur as u64) >= want {
+            return;
+        }
+        lim.rlim_cur = want as libc::rlim_t;
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+    }
 }

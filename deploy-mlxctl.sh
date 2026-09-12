@@ -57,7 +57,7 @@ for ip in "${NODES[@]}"; do
   echo "==== deploy $ip ===="
   ssh -o BatchMode=yes "${SSH_USER}@${ip}" "mkdir -p $REMOTE/libexec $REMOTE/bin $REMOTE/ui $REMOTE/logs"
   scp -o BatchMode=yes "$BIN_SRC" "${SSH_USER}@${ip}":$REMOTE/libexec/mlxctl
-  ssh -o BatchMode=yes "${SSH_USER}@${ip}" "xattr -cr $REMOTE/libexec/mlxctl && ln -sfn $REMOTE/libexec/mlxctl $REMOTE/bin/mlxctl && chmod +x $REMOTE/libexec/mlxctl $REMOTE/setup-tb.sh"
+  ssh -o BatchMode=yes "${SSH_USER}@${ip}" "xattr -cr $REMOTE/libexec/mlxctl && codesign --force --sign - --timestamp=none $REMOTE/libexec/mlxctl && ln -sfn $REMOTE/libexec/mlxctl $REMOTE/bin/mlxctl && chmod +x $REMOTE/libexec/mlxctl $REMOTE/setup-tb.sh"
   scp -o BatchMode=yes "$TMP" "${SSH_USER}@${ip}":$REMOTE/mlxctl.toml
   scp -o BatchMode=yes "$ROOT/mlxctl/python/serve_entry.py" \
     "$ROOT/setup-tb.sh" "$ROOT/jaccl-mesh.json" "${SSH_USER}@${ip}":$REMOTE/

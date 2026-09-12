@@ -1,7 +1,10 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServeProfile {
@@ -45,6 +48,8 @@ pub struct LocalModel {
     pub cluster_complete: bool,
     #[serde(default)]
     pub source_node: Option<String>,
+    #[serde(default)]
+    pub downloading: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -54,6 +59,8 @@ pub struct ModelReplica {
     pub size_bytes: u64,
     #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub downloading: bool,
 }
 
 pub fn scan_models(roots: &[PathBuf]) -> Vec<LocalModel> {
@@ -115,6 +122,7 @@ pub fn attach_profile(model: &mut LocalModel) {
         &model.id,
         &model.name,
         vision,
+        model.size_bytes,
     );
 }
 
@@ -125,8 +133,12 @@ fn inspect_model(path: &Path, folder: &str) -> Option<LocalModel> {
     if !has_config && !has_weights {
         return None;
     }
-    let size_bytes = dir_size(path);
-    let complete = has_config && has_weights && size_bytes > 10 * 1024 * 1024;
+    let downloading = download_in_progress(path);
+    let size_bytes = dir_size(path, downloading);
+    let complete = has_config
+        && has_weights
+        && size_bytes > 10 * 1024 * 1024
+        && snapshot_complete(path);
     let (kind, architecture) = if has_config {
         classify(&config_path)
     } else {
@@ -135,7 +147,14 @@ fn inspect_model(path: &Path, folder: &str) -> Option<LocalModel> {
     let id = folder.to_string();
     let name = folder.replace("--", "/");
     let vision = kind.starts_with("vlm");
-    let profile = serve_profile(&kind, architecture.as_deref(), &id, &name, vision);
+    let profile = serve_profile(
+        &kind,
+        architecture.as_deref(),
+        &id,
+        &name,
+        vision,
+        size_bytes,
+    );
     Some(LocalModel {
         id,
         name,
@@ -148,6 +167,7 @@ fn inspect_model(path: &Path, folder: &str) -> Option<LocalModel> {
         replicas: Vec::new(),
         cluster_complete: false,
         source_node: None,
+        downloading,
     })
 }
 
@@ -159,6 +179,91 @@ fn has_weight_files(path: &Path) -> bool {
         let n = e.file_name().to_string_lossy().to_string();
         n.ends_with(".safetensors") || n.ends_with(".npz") || n == "model.safetensors.index.json"
     })
+}
+
+fn snapshot_complete(path: &Path) -> bool {
+    if let Some(ok) = numbered_shards_complete(path) {
+        return ok;
+    }
+    if let Some(ok) = index_shards_complete(path) {
+        return ok;
+    }
+    !hf_cache_has_incomplete(path)
+}
+
+pub fn download_in_progress(path: &Path) -> bool {
+    if numbered_shards_complete(path) == Some(true) {
+        return false;
+    }
+    if index_shards_complete(path) == Some(true) {
+        return false;
+    }
+    if hf_cache_has_incomplete(path) {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n.starts_with('.') && n.contains(".safetensors")
+    })
+}
+
+fn hf_cache_has_incomplete(path: &Path) -> bool {
+    let download = path.join(".cache").join("huggingface").join("download");
+    let Ok(entries) = fs::read_dir(download) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_string_lossy()
+            .ends_with(".incomplete")
+    })
+}
+
+fn parse_numbered_shard(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("model-")?.strip_suffix(".safetensors")?;
+    let (idx, total) = rest.split_once("-of-")?;
+    Some((idx.parse().ok()?, total.parse().ok()?))
+}
+
+fn numbered_shards_complete(path: &Path) -> Option<bool> {
+    let entries = fs::read_dir(path).ok()?;
+    let mut total = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some((idx, n)) = parse_numbered_shard(&name) else {
+            continue;
+        };
+        match total {
+            None => total = Some(n),
+            Some(prev) if prev != n => return Some(false),
+            Some(_) => {}
+        }
+        seen.insert(idx);
+    }
+    let total = total?;
+    Some(total > 0 && seen.len() as u32 == total && (1..=total).all(|i| seen.contains(&i)))
+}
+
+fn index_shards_complete(path: &Path) -> Option<bool> {
+    let index = path.join("model.safetensors.index.json");
+    if !index.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&index).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let map = v.get("weight_map")?.as_object()?;
+    if map.is_empty() {
+        return Some(false);
+    }
+    let files: std::collections::BTreeSet<&str> = map
+        .values()
+        .filter_map(|x| x.as_str())
+        .collect();
+    Some(files.iter().all(|f| path.join(f).is_file()))
 }
 
 fn classify(config_path: &Path) -> (String, Option<String>) {
@@ -221,31 +326,54 @@ fn family_of(architecture: Option<&str>, id: &str, name: &str) -> &'static str {
     "generic"
 }
 
+fn looks_4bit(id: &str, name: &str) -> bool {
+    let blob = format!("{id} {name}").to_lowercase();
+    blob.contains("4bit")
+        || blob.contains("4-bit")
+        || blob.contains("q4_")
+        || blob.contains("-q4")
+}
+
 pub fn serve_profile(
     kind: &str,
     architecture: Option<&str>,
     id: &str,
     name: &str,
     vision: bool,
+    _size_bytes: u64,
 ) -> ServeProfile {
     match family_of(architecture, id, name) {
-        "qwen4_exp" => ServeProfile {
-            family: "qwen4_exp".into(),
-            title: "Qwen3.8-Flash-Next".into(),
-            default_runtime: "mlx_vlm".into(),
-            allow_vlm: true,
-            allow_lm: false,
-            vision: true,
-            load_vlm_label: "加载视觉".into(),
-            load_lm_label: "加载文本".into(),
-            hint: "必须走 mlx-vlm。语言侧 TP 切分，PLE n-gram 各机 mmap/复制。不要点「加载文本」。".into(),
-            chat_safe_max_tokens: 2048,
-            chat_long_max_tokens: 8192,
-            chat_long_default_tokens: 4096,
-            chat_long_hint: "Flash-Next 超长补全上限 8192；PLE 热路径会读盘".into(),
-            thinking: false,
-            temperature: 0.7,
-        },
+        "qwen4_exp" => {
+            let fourbit = looks_4bit(id, name);
+            let (title, hint) = if fourbit {
+                (
+                    "Qwen3.8-Flash-Next 4bit".into(),
+                    "必须走 mlx-vlm（点「加载视觉」）。4bit 约 104GB，四卡 TP 后 64GB worker 放得下；PLE n-gram 磁盘 mmap。日志应持续出现 JACCL / sharded_load；若停在 Loading model 超过 30 秒，是通信卡住，点「中止加载」再重载。不要点「加载文本」。".into(),
+                )
+            } else {
+                (
+                    "Qwen3.8-Flash-Next bf16".into(),
+                    "必须走 mlx-vlm。这是 bf16 全量约 336GB，PLE n-gram 约 99GB 不能切分，64GB worker 放不下。请改加载同系列 4bit，或 Qwen3.8-27B。不要点「加载文本」。".into(),
+                )
+            };
+            ServeProfile {
+                family: "qwen4_exp".into(),
+                title,
+                default_runtime: "mlx_vlm".into(),
+                allow_vlm: true,
+                allow_lm: false,
+                vision: true,
+                load_vlm_label: "加载视觉".into(),
+                load_lm_label: "加载文本".into(),
+                hint,
+                chat_safe_max_tokens: 2048,
+                chat_long_max_tokens: 8192,
+                chat_long_default_tokens: 4096,
+                chat_long_hint: "Flash-Next 超长补全上限 8192；PLE 热路径会读盘".into(),
+                thinking: false,
+                temperature: 0.7,
+            }
+        }
         "deepseek_v4" => ServeProfile {
             family: "deepseek_v4".into(),
             title: "DeepSeek-V4-Flash".into(),
@@ -255,7 +383,7 @@ pub fn serve_profile(
             vision: false,
             load_vlm_label: "加载 V4".into(),
             load_lm_label: "加载文本".into(),
-            hint: "mlx-lm 0.31 没有 deepseek_v4。用 mlx-vlm 文本 TP（按钮叫「加载 V4」）。无图。".into(),
+            hint: "mlx-lm 0.31 没有 deepseek_v4。用 mlx-vlm 文本 TP（按钮叫「加载 V4」）。无图。中文请用 ByteLevel 解码；若仍乱码先卸下再加载。".into(),
             chat_safe_max_tokens: 2048,
             chat_long_max_tokens: 8192,
             chat_long_default_tokens: 4096,
@@ -331,7 +459,7 @@ fn path_exists_near(config_path: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn dir_size(path: &Path) -> u64 {
+fn dir_size(path: &Path, include_cache: bool) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -342,7 +470,7 @@ fn dir_size(path: &Path) -> u64 {
             let p = e.path();
             if p.is_dir() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name == ".cache" {
+                if name == ".cache" && !include_cache {
                     continue;
                 }
                 stack.push(p);
@@ -354,27 +482,153 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
-pub fn pull_model(python: &Path, repo: &str, dest: &Path) -> Result<String> {
-    fs::create_dir_all(dest)?;
+pub struct PullOpts<'a> {
+    pub python: &'a Path,
+    pub repo: &'a str,
+    pub dest: &'a Path,
+    pub token: Option<&'a str>,
+    pub endpoint: Option<&'a str>,
+}
+
+pub fn folder_for_repo(repo: &str) -> String {
+    repo.trim().trim_matches('/').replace('/', "--")
+}
+
+pub fn path_under_roots(roots: &[PathBuf], dest: &Path) -> bool {
+    if dest.as_os_str().is_empty() {
+        return false;
+    }
+    let dest = if dest.is_absolute() {
+        dest.to_path_buf()
+    } else {
+        return false;
+    };
+    roots.iter().any(|root| dest == *root || dest.starts_with(root))
+}
+
+pub fn pull_model(opts: PullOpts<'_>, mut on_line: impl FnMut(&str)) -> Result<String> {
+    fs::create_dir_all(opts.dest)?;
     let code = r#"
-import os, sys
+import os, sys, threading, time
 from huggingface_hub import snapshot_download
 repo, dest = sys.argv[1], sys.argv[2]
-snapshot_download(repo_id=repo, local_dir=dest)
-print(dest)
+print(f"start {repo} -> {dest}", flush=True)
+stop = threading.Event()
+
+def watch():
+    while not stop.wait(4):
+        total = 0
+        files = 0
+        incomplete = 0
+        for root, _, names in os.walk(dest):
+            for name in names:
+                path = os.path.join(root, name)
+                try:
+                    total += os.path.getsize(path)
+                except OSError:
+                    continue
+                files += 1
+                if name.endswith(".incomplete"):
+                    incomplete += 1
+        gb = total / (1024 ** 3)
+        print(f"progress files={files} incomplete={incomplete} {gb:.2f}GB", flush=True)
+
+t = threading.Thread(target=watch, daemon=True)
+t.start()
+try:
+    path = snapshot_download(repo_id=repo, local_dir=dest)
+    print(f"done {path}", flush=True)
+except Exception as exc:
+    print(f"error {exc}", flush=True)
+    raise
+finally:
+    stop.set()
 "#;
-    let out = std::process::Command::new(python)
+    let mut cmd = Command::new(opts.python);
+    cmd.arg("-u")
         .env("HF_HUB_DISABLE_XET", "1")
         .env("HF_HUB_DISABLE_TELEMETRY", "1")
-        .args(["-c", code, repo, &dest.display().to_string()])
-        .output()?;
-    if !out.status.success() {
+        .env("HF_HUB_ENABLE_HF_TRANSFER", "0")
+        .env("PYTHONUNBUFFERED", "1");
+    if let Some(token) = opts.token.filter(|t| !t.is_empty()) {
+        cmd.env("HF_TOKEN", token)
+            .env("HUGGING_FACE_HUB_TOKEN", token);
+    }
+    if let Some(endpoint) = opts.endpoint.filter(|e| !e.is_empty()) {
+        cmd.env("HF_ENDPOINT", endpoint);
+    }
+    let dest = opts.dest.display().to_string();
+    let mut child = cmd
+        .args(["-c", code, opts.repo, &dest])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx2.send(line);
+        }
+    });
+    let mut last = String::new();
+    while let Ok(line) = rx.recv() {
+        last = line.clone();
+        on_line(&line);
+    }
+    let status = child.wait()?;
+    if !status.success() {
         anyhow::bail!(
             "pull failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            if last.is_empty() {
+                format!("exit {status}")
+            } else {
+                last
+            }
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(dest)
+}
+
+pub fn delete_model(roots: &[PathBuf], folder: &str) -> Result<String> {
+    let folder = folder.trim();
+    if folder.is_empty()
+        || folder.contains("..")
+        || folder.contains('/')
+        || folder.contains('\\')
+        || Path::new(folder).is_absolute()
+    {
+        anyhow::bail!("bad model id");
+    }
+    let mut removed = Vec::new();
+    for root in roots {
+        let dest = root.join(folder);
+        if !dest.exists() {
+            continue;
+        }
+        let Ok(root_c) = root.canonicalize() else {
+            continue;
+        };
+        let Ok(dest_c) = dest.canonicalize() else {
+            continue;
+        };
+        if dest_c == root_c || !dest_c.starts_with(&root_c) {
+            anyhow::bail!("refusing to delete {}", dest_c.display());
+        }
+        fs::remove_dir_all(&dest_c)?;
+        removed.push(dest_c.display().to_string());
+    }
+    if removed.is_empty() {
+        anyhow::bail!("not found");
+    }
+    Ok(removed.join("\n"))
 }
 
 pub fn ssh_user() -> String {

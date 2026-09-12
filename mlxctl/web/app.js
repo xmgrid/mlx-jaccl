@@ -49,6 +49,7 @@ function renderNodes(st) {
   const rt = st.serving.runtime ? ` · ${st.serving.runtime}` : "";
   pill.textContent = st.serving.status + (st.serving.model_id ? ` · ${st.serving.model_id}` : "") + (st.serving.status !== "stopped" ? rt : "");
   pill.className = `pill ${st.serving.status}`;
+  syncUnloadButtons(st);
   $("#mesh-hint").textContent = st.mesh_ready
     ? "Thunderbolt 全互连就绪"
     : "有节点未连通，先点「启动网络」";
@@ -72,14 +73,26 @@ function renderNodes(st) {
       modelHint.textContent = `已从 ${st.sync.source} 同步完 ${st.sync.model_id}。四台齐全后即可加载。`;
     } else if (st.sync && st.sync.status === "error") {
       modelHint.textContent = `同步失败：${(st.sync.log || "").trim().split("\n").slice(-2).join(" ")}`;
+    } else if (st.pull && st.pull.status === "running") {
+      const last = (st.pull.log || "").trim().split("\n").slice(-1)[0] || "";
+      modelHint.textContent = `正在 ${st.pull.node} 下载 ${st.pull.repo}。${last} 进度在「日志」页。`;
+    } else if (st.pull && st.pull.status === "ok") {
+      modelHint.textContent = `已在 ${st.pull.node} 下完 ${st.pull.repo}。点「同步到四台」再加载。`;
+    } else if (st.pull && st.pull.status === "error") {
+      modelHint.textContent = `拉取失败：${(st.pull.log || "").trim().split("\n").slice(-2).join(" ")}`;
     } else if (st.serving.status === "ready") {
-      modelHint.textContent = `正在运行 ${st.serving.model_id || ""} · ${st.serving.runtime || ""}。换模型再点另一行的「加载」。`;
+      modelHint.textContent = `正在运行 ${st.serving.model_id || ""} · ${st.serving.runtime || ""}。换模型请先点「卸下」，或直接点另一行加载（会先卸下当前模型）。`;
     } else if (st.serving.status === "starting") {
-      modelHint.textContent = "正在四台加载，右上角变成 ready 后即可对话。";
+      const elapsed = loadingElapsed(st.serving);
+      modelHint.textContent = elapsed
+        ? `正在四台加载（已 ${elapsed}）。「日志」页每 3 秒刷新。若停在 Loading model 且没有新行，是 JACCL 卡住，不是 mmap，点「中止加载」再重载。`
+        : "正在四台加载。「日志」页每 3 秒刷新。若停在 Loading model 且没有新行，是 JACCL 卡住，点「中止加载」再重载。";
+    } else if (st.serving.status === "stopping") {
+      modelHint.textContent = "正在卸下当前模型，卸完后再点加载。";
     } else if (st.serving.status === "error") {
       modelHint.textContent = `加载失败：${st.serving.error || "看「日志」页"}`;
     } else {
-      modelHint.textContent = "一台下完后点「同步到四台」。四台都完整才能加载。";
+      modelHint.textContent = "先保存 Hub 设置，选一台已装 huggingface_hub 的机器拉取，下完再同步到四台。";
     }
   }
   $("#nodes").innerHTML = st.nodes
@@ -96,12 +109,64 @@ function renderNodes(st) {
       return `<article class="card">
         <h2><span class="dot ${n.reachable ? "ok" : ""}"></span>${n.name}</h2>
         <p class="meta">rank ${n.rank} · ${n.ssh}<br>${n.hostname || "离线"} · ${mem}</p>
-        <p class="meta">RDMA ${n.rdma_enabled ? "on" : "off"} · mesh ${n.mesh_ready ? "ok" : "no"} · lm ${n.mlx_lm || "—"} · vlm ${n.mlx_vlm || "—"}</p>
+        <p class="meta">RDMA ${n.rdma_enabled ? "on" : "off"} · mesh ${n.mesh_ready ? "ok" : "no"} · lm ${n.mlx_lm || "—"} · vlm ${n.mlx_vlm || "—"} · hf ${n.huggingface_hub || "—"}</p>
+        ${n.python ? `<p class="meta">venv ${escapeHtml(n.python)}</p>` : ""}
         <ul class="links">${links || "<li>无链路数据</li>"}</ul>
         ${n.error ? `<p class="meta">${n.error}</p>` : ""}
       </article>`;
     })
     .join("");
+}
+
+function fillNodeSelect(sel, nodes, fallback) {
+  if (!sel) return;
+  const editing = document.activeElement === sel;
+  const prev = sel.value;
+  sel.innerHTML = (nodes || [])
+    .map((n) => {
+      const hf = n.huggingface_hub;
+      const label = hf ? `${n.name} · hf ${hf}` : `${n.name} · 未安装 huggingface_hub`;
+      const disabled = hf ? "" : " disabled";
+      return `<option value="${escapeHtml(n.name)}"${disabled}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  const want = editing ? prev : (prev || fallback || "");
+  const ok = [...sel.options].some((o) => o.value === want && !o.disabled);
+  if (ok) {
+    sel.value = want;
+    return;
+  }
+  const ready = (nodes || []).find((n) => n.huggingface_hub);
+  if (ready) sel.value = ready.name;
+}
+
+function selectedPullNode() {
+  const pull = $("#pull-node");
+  const hub = $("#hub-form")?.node;
+  const node = pull?.value || hub?.value || "";
+  const opt = pull?.selectedOptions?.[0] || hub?.selectedOptions?.[0];
+  if (!node) return { node: "", error: "先在「拉取到」选一台已安装 huggingface_hub 的机器" };
+  if (opt?.disabled) {
+    return { node, error: "所选机器没有 huggingface_hub，换一台或先在该机 venv 里安装" };
+  }
+  return { node, error: "" };
+}
+
+function renderHub(st) {
+  const f = $("#hub-form");
+  if (!f) return;
+  const hub = st.hub || {};
+  const nodes = st.nodes || [];
+  fillNodeSelect(f.node, nodes, hub.node);
+  fillNodeSelect($("#pull-node"), nodes, $("#pull-node")?.value || hub.node);
+  const current = document.activeElement && f.contains(document.activeElement);
+  if (current) return;
+  f.token.placeholder = hub.token_set ? "已保存，留空不改" : "hf_…";
+  f.token.value = "";
+  f.token_clear.checked = false;
+  f.endpoint.value = hub.endpoint || "";
+  f.dest_dir.value = hub.dest_dir || "";
+  f.python.value = hub.python || "";
 }
 
 function renderEndpoints(st) {
@@ -150,16 +215,55 @@ curl ${ep.claude_url}/v1/messages \\
   -d '{"model":"claude-sonnet-4-5","max_tokens":128,"messages":[{"role":"user","content":"你好"}]}'`;
 }
 
+function servingActive(st = lastStatus) {
+  const s = st?.serving?.status;
+  return s === "ready" || s === "starting" || s === "stopping" || s === "error";
+}
+
+function syncUnloadButtons(st) {
+  const show = servingActive(st) && st?.serving?.status !== "stopped";
+  const starting = st?.serving?.status === "starting";
+  const stopping = st?.serving?.status === "stopping";
+  const top = $("#btn-unload");
+  const models = $("#btn-model-unload");
+  if (top) {
+    top.hidden = !show;
+    top.disabled = stopping;
+    top.textContent = starting ? "中止加载" : "卸下";
+  }
+  if (models) {
+    models.hidden = !show;
+    models.disabled = stopping;
+    models.textContent = starting ? "中止加载" : "卸下当前模型";
+  }
+}
+
+async function unloadCurrent() {
+  try {
+    flash("正在卸下当前模型…");
+    await api("/api/serve/stop", { method: "POST", body: "{}" });
+    flash("已卸下，可以加载其他模型");
+    await refresh();
+  } catch (e) {
+    flash(e.message);
+  }
+}
+
 function replicaLabel(m) {
   const reps = m.replicas || [];
   if (!reps.length) {
     return m.complete ? "本机完整" : "不完整";
   }
   const have = reps.filter((r) => r.complete);
-  const missing = reps.filter((r) => !r.complete).map((r) => r.node);
-  const src = m.source_node || (have[0] && have[0].node) || "";
+  const downloading = reps.filter((r) => r.downloading);
+  const missing = reps.filter((r) => !r.complete && !r.downloading).map((r) => r.node);
+  const src = m.source_node || (have[0] && have[0].node) || (downloading[0] && downloading[0].node) || "";
   if (m.cluster_complete) {
     return `四台完整`;
+  }
+  if (downloading.length) {
+    const who = downloading.map((r) => `${r.node} ${bytes(r.size_bytes)}`).join("、");
+    return `下载中 · ${who}`;
   }
   if (have.length) {
     return `${have.length}/${reps.length} · ${src}${missing.length ? ` · 缺 ${missing.join("、")}` : ""}`;
@@ -175,22 +279,34 @@ function renderModels(models, serving, stack) {
       const loaded = serving.model_id === m.id || serving.model_path === m.path;
       const p = m.profile || {};
       let actions = "";
+      if (m.downloading) {
+        actions += `<span class="meta">下载中</span> `;
+      }
       if (m.complete) {
         const syncLabel = m.cluster_complete ? "再同步" : "同步到四台";
-        actions += `<button type="button" data-sync="${m.id}" ${syncing ? "disabled" : ""}>${syncLabel}</button> `;
+        actions += `<button type="button" data-sync="${m.id}" ${syncing || m.downloading ? "disabled" : ""}>${syncLabel}</button> `;
       }
       if (m.cluster_complete) {
+        const busy = servingActive({ serving });
+        const thisLoaded = loaded && busy;
+        if (thisLoaded) {
+          const stopLabel = serving.status === "starting" ? "中止加载" : "卸下";
+          actions += `<button type="button" class="danger" data-unload="${escapeHtml(m.id)}" ${serving.status === "stopping" ? "disabled" : ""}>${stopLabel}</button> `;
+        }
         if (p.allow_vlm) {
           const primary = p.default_runtime === "mlx_vlm" ? "primary" : "";
-          actions += `<button type="button" class="${primary}" data-load="${m.id}" data-runtime="mlx_vlm" ${vlmReady ? "" : "disabled"}>${escapeHtml(p.load_vlm_label || "加载视觉")}</button> `;
+          const label = thisLoaded ? "重新加载视觉" : (p.load_vlm_label || "加载视觉");
+          actions += `<button type="button" class="${primary}" data-load="${m.id}" data-runtime="mlx_vlm" ${vlmReady ? "" : "disabled"}>${escapeHtml(label)}</button> `;
         }
         if (p.allow_lm) {
           const primary = p.default_runtime !== "mlx_vlm" ? "primary" : "";
-          actions += `<button type="button" class="${primary}" data-load="${m.id}" data-runtime="mlx_lm">${escapeHtml(p.load_lm_label || "加载")}</button>`;
+          const label = thisLoaded ? "重新加载" : (p.load_lm_label || "加载");
+          actions += `<button type="button" class="${primary}" data-load="${m.id}" data-runtime="mlx_lm">${escapeHtml(label)}</button>`;
         }
       } else if (m.complete) {
         actions += `<span class="meta">先同步再加载</span>`;
       }
+      const del = `<button type="button" class="danger" data-del="${escapeHtml(m.id)}">删除四台</button>`;
       return `<tr>
         <td>${escapeHtml(m.name)}<br><span class="meta">${escapeHtml(m.path)}</span></td>
         <td><span class="family-tag">${escapeHtml(p.title || m.kind)}</span><br><span class="meta">${escapeHtml(m.kind)}${m.architecture ? ` · ${escapeHtml(m.architecture)}` : ""}</span></td>
@@ -198,6 +314,7 @@ function renderModels(models, serving, stack) {
         <td>${replicaLabel(m)}${loaded ? " · 已加载" : ""}</td>
         <td class="model-plan">${escapeHtml(p.hint || "")}</td>
         <td>${actions}</td>
+        <td>${del}</td>
       </tr>`;
     })
     .join("");
@@ -228,15 +345,9 @@ $("#btn-cluster-up").addEventListener("click", async () => {
   }
 });
 
-$("#btn-serve-stop").addEventListener("click", async () => {
-  try {
-    await api("/api/serve/stop", { method: "POST", body: "{}" });
-    flash("推理已停止");
-    await refresh();
-  } catch (e) {
-    flash(e.message);
-  }
-});
+$("#btn-serve-stop").addEventListener("click", unloadCurrent);
+$("#btn-unload").addEventListener("click", unloadCurrent);
+$("#btn-model-unload").addEventListener("click", unloadCurrent);
 
 $("#copy-url").addEventListener("click", async () => {
   if (!lastStatus) return;
@@ -256,22 +367,50 @@ $("#copy-claude").addEventListener("click", async () => {
 $("#btn-pull").addEventListener("click", async () => {
   const repo = $("#pull-repo").value.trim();
   if (!repo) return;
+  const f = $("#hub-form");
+  const picked = selectedPullNode();
+  if (picked.error) {
+    flash(picked.error);
+    return;
+  }
   try {
-    flash("四台同时拉取 " + repo);
+    flash(`在 ${picked.node} 开始下载 ${repo}，模型页会显示进度`);
     const out = await api("/api/models/pull", {
       method: "POST",
-      body: JSON.stringify({ repo }),
+      body: JSON.stringify({
+        repo,
+        nodes: [picked.node],
+        dest: f.dest_dir.value.trim() || undefined,
+      }),
     });
-    flash("已下发拉取任务");
+    const err = (out.nodes || []).find((n) => n.error || (n.status && n.status >= 400));
+    flash(err ? `${err.node}: ${err.error || err.body}` : `正在 ${picked.node} 下载，看模型页「下载中」和日志`);
     console.log(out);
   } catch (e) {
     flash(e.message);
   }
 });
 
+$("#pull-node")?.addEventListener("change", () => {
+  const f = $("#hub-form");
+  if (f?.node && $("#pull-node").value) f.node.value = $("#pull-node").value;
+});
+
+$("#hub-form")?.node?.addEventListener("change", () => {
+  const pull = $("#pull-node");
+  if (pull && $("#hub-form").node.value) pull.value = $("#hub-form").node.value;
+});
+
 $$(".pull-chip").forEach((btn) => {
   btn.addEventListener("click", () => {
-    $("#pull-repo").value = btn.dataset.repo || "";
+    const repo = btn.dataset.repo || "";
+    $("#pull-repo").value = repo;
+    const picked = selectedPullNode();
+    if (picked.error) {
+      flash(picked.error);
+      $("#pull-node")?.focus();
+      return;
+    }
     $("#btn-pull").click();
   });
 });
@@ -291,6 +430,26 @@ $("#btn-install-vlm").addEventListener("click", async () => {
 });
 
 $("#model-rows").addEventListener("click", async (ev) => {
+  const delId = ev.target?.dataset?.del;
+  if (delId) {
+    const name = ev.target.closest("tr")?.querySelector("td")?.innerText?.split("\n")[0] || delId;
+    if (!window.confirm(`从四台删除 ${name}？不可恢复。若正在加载会先停止推理。`)) {
+      return;
+    }
+    try {
+      flash("正在四台删除…");
+      await api("/api/models/delete", {
+        method: "POST",
+        body: JSON.stringify({ model_id: delId }),
+        signal: AbortSignal.timeout(180000),
+      });
+      flash("已删除");
+      await refresh();
+    } catch (e) {
+      flash(e.message);
+    }
+    return;
+  }
   const syncId = ev.target?.dataset?.sync;
   if (syncId) {
     try {
@@ -307,20 +466,67 @@ $("#model-rows").addEventListener("click", async (ev) => {
     }
     return;
   }
+  const unloadId = ev.target?.dataset?.unload;
+  if (unloadId) {
+    await unloadCurrent();
+    return;
+  }
   const id = ev.target?.dataset?.load;
   if (!id) return;
   const runtime = ev.target.dataset.runtime || undefined;
-    try {
-    flash(runtime === "mlx_vlm" ? "正在按该方案加载（mlx-vlm）…" : "正在四台加载…");
+  const name = ev.target.closest("tr")?.querySelector("td")?.innerText?.split("\n")[0] || id;
+  const serving = lastStatus?.serving;
+  const busy = servingActive();
+  const current = serving?.model_id || serving?.model_path || "";
+  if (busy && serving?.status === "stopping") {
+    flash("正在卸下当前模型，稍后再加载");
+    return;
+  }
+  if (busy && current && current !== id) {
+    const action = serving.status === "starting" ? "中止当前加载" : "先卸下";
+    if (!window.confirm(`当前正在运行 ${current}。${action}再加载 ${name}？`)) {
+      return;
+    }
+  } else if (busy && current === id) {
+    if (!window.confirm(`${name} 已在运行或正在加载。卸下后重新加载？`)) {
+      return;
+    }
+  }
+  try {
+    flash(runtime === "mlx_vlm" ? "正在卸下旧模型并按该方案加载（mlx-vlm）…" : "正在卸下旧模型并四台加载…");
     await api("/api/serve/start", {
       method: "POST",
       body: JSON.stringify({ model_id: id, runtime, autostart: true }),
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(180000),
     });
     flash("已开始加载，状态栏会变成 ready");
     await refresh();
   } catch (e) {
     flash(e.name === "TimeoutError" ? "加载请求超时，看「日志」页" : e.message);
+  }
+});
+
+$("#hub-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  try {
+    await api("/api/hub", {
+      method: "PUT",
+      body: JSON.stringify({
+        token: f.token.value.trim(),
+        token_clear: f.token_clear.checked,
+        endpoint: f.endpoint.value,
+        python: f.python.value.trim(),
+        dest_dir: f.dest_dir.value.trim(),
+        node: f.node.value,
+      }),
+    });
+    f.token.value = "";
+    f.token_clear.checked = false;
+    flash("Hub 设置已保存");
+    await refresh();
+  } catch (e) {
+    flash(e.message);
   }
 });
 
@@ -351,34 +557,63 @@ async function refreshLogs() {
     const sync = logs.sync
       ? `\n\n==== sync ${logs.sync.status || ""} ${logs.sync.source || ""} → ${logs.sync.model_id || ""} ====\n${logs.sync.log || ""}`
       : "";
-    $("#log-box").textContent = (logs.serve || "暂无日志") + sync;
+    const pull = logs.pull
+      ? `\n\n==== pull ${logs.pull.status || ""} ${logs.pull.node || ""} ${logs.pull.repo || ""} ====\n${logs.pull.log || ""}`
+      : "";
+    $("#log-box").textContent = (logs.serve || "暂无日志") + sync + pull;
   } catch (e) {
     $("#log-box").textContent = e.message;
   }
 }
 
+$("#btn-clear-logs")?.addEventListener("click", async () => {
+  if (!window.confirm("清除推理日志？正在下载或同步的进度会保留。")) {
+    return;
+  }
+  try {
+    const out = await api("/api/logs/clear", { method: "POST", body: "{}" });
+    if (out && out.ok === false) {
+      throw new Error(out.error || "清除失败");
+    }
+    flash("日志已清除");
+    await refreshLogs();
+  } catch (e) {
+    flash(e.message);
+  }
+});
+
 async function refresh() {
   const [st, models] = await Promise.all([api("/api/status"), api("/api/models")]);
   lastStatus = st;
   renderNodes(st);
+  renderHub(st);
   renderEndpoints(st);
   renderChatMeta(st);
   renderModels(models, st.serving, st.stack);
+}
+
+function logsTabOn() {
+  return document.querySelector(".tabs button.on")?.dataset.tab === "logs";
 }
 
 refresh().catch((e) => flash(e.message));
 setInterval(() => {
   api("/api/status")
     .then(async (st) => {
-      const was = lastStatus?.sync?.status;
+      const wasSync = lastStatus?.sync?.status;
+      const wasPull = lastStatus?.pull?.status;
       lastStatus = st;
       renderNodes(st);
+      renderHub(st);
       renderEndpoints(st);
       renderChatMeta(st);
-      if (st.sync?.status === "running" || (was === "running" && st.sync?.status !== "running")) {
+      const syncBusy = st.sync?.status === "running" || (wasSync === "running" && st.sync?.status !== "running");
+      const pullBusy = st.pull?.status === "running" || (wasPull === "running" && st.pull?.status !== "running");
+      if (syncBusy || pullBusy) {
         const models = await api("/api/models");
         renderModels(models, st.serving, st.stack);
       }
+      if (logsTabOn()) refreshLogs();
     })
     .catch(() => {});
 }, 3000);
@@ -387,7 +622,7 @@ setInterval(() => {
   api("/api/models")
     .then((models) => renderModels(models, lastStatus.serving, lastStatus.stack))
     .catch(() => {});
-}, 15000);
+}, 5000);
 
 const CHAT_LANG_KEY = "mlxctl.chat.lang";
 const CHAT_LONG_KEY = "mlxctl.chat.long";
@@ -546,6 +781,16 @@ function syncTokenLimits({ bumpIfEnabling } = {}) {
   persistChatGenSettings();
 }
 
+function loadingElapsed(serving) {
+  const started = Date.parse(serving?.started_at || "");
+  if (!started) return "";
+  const sec = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  if (sec < 60) return `${sec} 秒`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return s ? `${m} 分 ${s} 秒` : `${m} 分钟`;
+}
+
 function chatReady() {
   return lastStatus?.serving?.status === "ready";
 }
@@ -558,7 +803,8 @@ function renderChatMeta(st) {
   if (s.status === "ready") {
     el.textContent = `${s.model_id || "local"} · ${p?.title || s.runtime || "mlx-lm"} · 已就绪`;
   } else if (s.status === "starting") {
-    el.textContent = "模型正在加载…";
+    const elapsed = loadingElapsed(s);
+    el.textContent = elapsed ? `模型正在加载…（已 ${elapsed}）` : "模型正在加载…";
   } else {
     el.textContent = "尚未加载模型，先到「模型」页点加载";
   }
@@ -698,6 +944,7 @@ async function sendChat(ev) {
         stream: true,
         max_tokens: chatMaxTokens(),
         temperature: servingProfile()?.temperature ?? 0.7,
+        enable_thinking: thinkingOn() && !!servingProfile()?.thinking,
       }),
     });
     if (!res.ok) {

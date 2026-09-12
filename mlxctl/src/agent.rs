@@ -24,12 +24,16 @@ struct AgentState {
     stack: Arc<Mutex<stack::Cache>>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Job {
     id: String,
     kind: String,
     status: String,
     log: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    dest: String,
 }
 
 #[derive(Serialize)]
@@ -50,6 +54,9 @@ struct AgentInfo {
     mlx_ok: bool,
     mlx_lm: Option<String>,
     mlx_vlm: Option<String>,
+    huggingface_hub: Option<String>,
+    python: String,
+    model_roots: Vec<String>,
     network: network::NetworkStatus,
 }
 
@@ -70,6 +77,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/v1/models", get(list_models))
         .route("/v1/models/pull", post(pull))
         .route("/v1/models/push", post(push))
+        .route("/v1/models/delete", post(delete_model))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/network", get(net_status))
         .route("/v1/network/up", post(net_up))
@@ -165,6 +173,14 @@ async fn info(
         mlx_ok,
         mlx_lm: pkgs.mlx_lm,
         mlx_vlm: pkgs.mlx_vlm,
+        huggingface_hub: pkgs.huggingface_hub,
+        python: st.cfg.python.display().to_string(),
+        model_roots: st
+            .cfg
+            .model_roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         network,
     }))
 }
@@ -212,6 +228,14 @@ async fn cleanup(
 #[derive(Deserialize)]
 struct PullReq {
     repo: String,
+    #[serde(default)]
+    dest: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    python: Option<String>,
 }
 
 async fn pull(
@@ -220,21 +244,81 @@ async fn pull(
     Json(req): Json<PullReq>,
 ) -> Result<Json<Job>, StatusCode> {
     check_token(&st, &headers)?;
+    let repo = req.repo.trim().to_string();
+    if repo.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let folder = models::folder_for_repo(&repo);
+    let dest = match req.dest.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => {
+            let p = std::path::PathBuf::from(raw);
+            if p.file_name().and_then(|n| n.to_str()) == Some(folder.as_str()) {
+                p
+            } else {
+                p.join(&folder)
+            }
+        }
+        None => st.cfg.model_roots[0].join(&folder),
+    };
+    if !models::path_under_roots(&st.cfg.model_roots, &dest) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let python = req
+        .python
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| st.cfg.python.clone());
+    let dest_s = dest.display().to_string();
+    {
+        let g = st.jobs.lock().await;
+        if let Some(existing) = g.values().find(|j| {
+            j.kind == "pull" && j.status == "running" && (j.dest == dest_s || j.repo == repo)
+        }) {
+            return Ok(Json(existing.clone()));
+        }
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let job = Job {
         id: id.clone(),
         kind: "pull".into(),
         status: "running".into(),
-        log: format!("pull {}\n", req.repo),
+        log: format!("pull {repo} → {dest_s}\n"),
+        repo: repo.clone(),
+        dest: dest_s.clone(),
     };
     st.jobs.lock().await.insert(id.clone(), job.clone());
-    let cfg = st.cfg.clone();
     let jobs = st.jobs.clone();
-    let repo = req.repo.clone();
+    let token = req.token.clone();
+    let endpoint = req.endpoint.clone();
     tokio::task::spawn_blocking(move || {
-        let folder = repo.replace('/', "--");
-        let dest = cfg.model_roots[0].join(&folder);
-        let result = models::pull_model(&cfg.python, &repo, &dest);
+        let append = |line: &str| {
+            let handle = tokio::runtime::Handle::current();
+            let jobs = jobs.clone();
+            let id = id.clone();
+            let line = line.to_string();
+            handle.block_on(async move {
+                let mut g = jobs.lock().await;
+                if let Some(j) = g.get_mut(&id) {
+                    j.log.push_str(&line);
+                    j.log.push('\n');
+                    if j.log.len() > 80_000 {
+                        j.log = j.log[j.log.len() - 60_000..].to_string();
+                    }
+                }
+            });
+        };
+        let result = models::pull_model(
+            models::PullOpts {
+                python: &python,
+                repo: &repo,
+                dest: &dest,
+                token: token.as_deref(),
+                endpoint: endpoint.as_deref(),
+            },
+            append,
+        );
         let handle = tokio::runtime::Handle::current();
         handle.block_on(async {
             let mut g = jobs.lock().await;
@@ -253,6 +337,37 @@ async fn pull(
         });
     });
     Ok(Json(job))
+}
+
+#[derive(Deserialize)]
+struct DeleteReq {
+    model_id: String,
+}
+
+async fn delete_model(
+    State(st): State<AgentState>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    check_token(&st, &headers)?;
+    let folder = req.model_id.trim().replace('/', "--");
+    let roots = st.cfg.model_roots.clone();
+    match tokio::task::spawn_blocking(move || models::delete_model(&roots, &folder))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        Ok(log) => Ok(Json(serde_json::json!({"ok": true, "log": log}))),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("not found") {
+                Ok(Json(serde_json::json!({"ok": true, "log": "not found"})))
+            } else if msg.contains("bad model") || msg.contains("refusing") {
+                Err(StatusCode::BAD_REQUEST)
+            } else {
+                Ok(Json(serde_json::json!({"ok": false, "error": msg})))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -292,6 +407,8 @@ async fn push(
             req.src_path,
             names.join(", ")
         ),
+        repo: String::new(),
+        dest: req.src_path.clone(),
     };
     st.jobs.lock().await.insert(id.clone(), job.clone());
     let jobs = st.jobs.clone();

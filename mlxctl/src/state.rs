@@ -16,6 +16,22 @@ pub struct PersistentState {
     pub runtime: String,
     pub endpoint: Option<EndpointConfig>,
     pub launch_pid: Option<u32>,
+    #[serde(default)]
+    pub hub: HubSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HubSettings {
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub python: String,
+    #[serde(default)]
+    pub dest_dir: String,
+    #[serde(default)]
+    pub node: String,
 }
 
 fn default_runtime() -> String {

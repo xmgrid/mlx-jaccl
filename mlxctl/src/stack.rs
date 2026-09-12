@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const ALLOWED: &[&str] = &["mlx-vlm", "mlx-lm", "mlx"];
+const ALLOWED: &[&str] = &["mlx-vlm", "mlx-lm", "mlx", "huggingface_hub"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Packages {
     pub mlx: Option<String>,
     pub mlx_lm: Option<String>,
     pub mlx_vlm: Option<String>,
+    pub huggingface_hub: Option<String>,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,7 @@ def v(n):
 v("mlx")
 v("mlx-lm")
 v("mlx-vlm")
+v("huggingface_hub")
 "#;
     let out = Command::new(python).args(["-c", code]).output();
     let mut pkgs = Packages::default();
@@ -71,6 +73,7 @@ v("mlx-vlm")
             "mlx" => pkgs.mlx = ver,
             "mlx-lm" => pkgs.mlx_lm = ver,
             "mlx-vlm" => pkgs.mlx_vlm = ver,
+            "huggingface_hub" => pkgs.huggingface_hub = ver,
             _ => {}
         }
     }

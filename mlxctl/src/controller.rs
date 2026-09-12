@@ -32,6 +32,7 @@ struct App {
     nodes: Arc<Mutex<Vec<NodeView>>>,
     endpoint_tx: watch::Sender<EndpointConfig>,
     sync: Arc<Mutex<Option<SyncView>>>,
+    pull: Arc<Mutex<Option<PullView>>>,
 }
 
 #[derive(Default)]
@@ -60,6 +61,9 @@ struct NodeView {
     mlx_ok: Option<bool>,
     mlx_lm: Option<String>,
     mlx_vlm: Option<String>,
+    huggingface_hub: Option<String>,
+    python: Option<String>,
+    model_roots: Vec<String>,
     rdma_enabled: Option<bool>,
     mesh_ready: Option<bool>,
     links: Vec<crate::network::LinkStatus>,
@@ -76,7 +80,9 @@ struct StatusView {
     nodes: Vec<NodeView>,
     mesh_ready: bool,
     stack: StackView,
+    hub: HubView,
     sync: Option<SyncView>,
+    pull: Option<PullView>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -86,6 +92,16 @@ struct SyncView {
     source: String,
     model_id: String,
     dests: Vec<String>,
+    log: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct PullView {
+    id: String,
+    status: String,
+    node: String,
+    repo: String,
+    dest: String,
     log: String,
 }
 
@@ -115,6 +131,15 @@ struct StackView {
 }
 
 #[derive(Serialize)]
+struct HubView {
+    token_set: bool,
+    endpoint: String,
+    python: String,
+    dest_dir: String,
+    node: String,
+}
+
+#[derive(Serialize)]
 struct EndpointView {
     advertise_host: String,
     bind: String,
@@ -136,13 +161,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let (endpoint_tx, endpoint_rx) = watch::channel(endpoint.clone());
     proxy::spawn(cfg.internal_infer_port, endpoint_rx);
 
-    let serving = Serving {
+    let mut serving = Serving {
         status: "stopped".into(),
         runtime: persist.runtime.clone(),
         model_id: persist.model_id.clone(),
         model_path: persist.model_path.clone(),
         ..Default::default()
     };
+    if persist.desired_serving {
+        if let Some(pid) = persist.launch_pid {
+            if serve::pid_alive(pid) {
+                serving.status = "ready".into();
+                serving.pid = Some(pid);
+                serving.started_at = Some(chrono::Local::now().to_rfc3339());
+                if let Some(path) = serving.model_path.as_deref() {
+                    serving.profile = crate::models::inspect_path(std::path::Path::new(path))
+                        .map(|m| m.profile);
+                }
+            }
+        }
+    }
 
     let app_state = App {
         persist: Arc::new(Mutex::new(persist)),
@@ -162,6 +200,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         endpoint_tx,
         cfg: Arc::new(cfg.clone()),
         sync: Arc::new(Mutex::new(None)),
+        pull: Arc::new(Mutex::new(None)),
     };
 
     let poller = app_state.clone();
@@ -188,8 +227,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/api/models", get(api_models))
         .route("/api/models/pull", post(api_pull))
         .route("/api/models/sync", post(api_sync))
+        .route("/api/models/delete", post(api_delete))
+        .route("/api/hub", get(api_hub).put(api_hub_put))
         .route("/api/endpoints", get(api_endpoints).put(api_endpoints_put))
         .route("/api/logs", get(api_logs))
+        .route("/api/logs/clear", post(api_logs_clear))
         .route("/api/infer/chat", post(api_infer_chat))
         .route("/api/stack/install", post(api_stack_install))
         .with_state(app_state);
@@ -212,6 +254,7 @@ async fn poll_loop(app: App) {
     loop {
         refresh_nodes(&app).await;
         refresh_sync(&app).await;
+        refresh_pull(&app).await;
         {
             let mut s = app.serving.lock().await;
             if let Some(pid) = s.pid {
@@ -318,6 +361,20 @@ async fn fetch_node(app: &App, node: &NodeConfig) -> NodeView {
                     .get("mlx_vlm")
                     .and_then(|x| x.as_str())
                     .map(|s| s.to_string());
+                v.huggingface_hub = body
+                    .get("huggingface_hub")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                v.python = body
+                    .get("python")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                if let Some(roots) = body.get("model_roots").and_then(|x| x.as_array()) {
+                    v.model_roots = roots
+                        .iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect();
+                }
                 if let Some(net) = body.get("network") {
                     v.rdma_enabled = net.get("rdma_enabled").and_then(|x| x.as_bool());
                     v.mesh_ready = net.get("mesh_ready").and_then(|x| x.as_bool());
@@ -377,7 +434,9 @@ async fn snapshot(app: &App) -> StatusView {
         nodes: nodes.clone(),
         mesh_ready,
         stack: summarize_stack(&nodes),
+        hub: hub_view(&app.cfg, &persist, &nodes),
         sync: app.sync.lock().await.clone(),
+        pull: app.pull.lock().await.clone(),
     }
 }
 
@@ -524,24 +583,226 @@ async fn api_models(State(app): State<App>) -> Json<Vec<LocalModel>> {
     Json(gather_models(&app).await)
 }
 
+fn hub_view(cfg: &Config, persist: &PersistentState, nodes: &[NodeView]) -> HubView {
+    let hub = &persist.hub;
+    let python = if hub.python.trim().is_empty() {
+        cfg.python.display().to_string()
+    } else {
+        hub.python.clone()
+    };
+    let dest_dir = if hub.dest_dir.trim().is_empty() {
+        cfg.model_roots
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                crate::config::home_dir()
+                    .join(".exo/models")
+                    .display()
+                    .to_string()
+            })
+    } else {
+        hub.dest_dir.clone()
+    };
+    let node = if !hub.node.trim().is_empty()
+        && nodes.iter().any(|n| n.name == hub.node)
+    {
+        hub.node.clone()
+    } else {
+        nodes
+            .iter()
+            .find(|n| n.huggingface_hub.is_some())
+            .or_else(|| nodes.iter().find(|n| n.rank == 0))
+            .or_else(|| nodes.first())
+            .map(|n| n.name.clone())
+            .unwrap_or_default()
+    };
+    HubView {
+        token_set: !hub.token.trim().is_empty(),
+        endpoint: hub.endpoint.clone(),
+        python,
+        dest_dir,
+        node,
+    }
+}
+
+async fn api_hub(State(app): State<App>) -> Json<HubView> {
+    let persist = app.persist.lock().await.clone();
+    let nodes = app.nodes.lock().await.clone();
+    Json(hub_view(&app.cfg, &persist, &nodes))
+}
+
+#[derive(Deserialize)]
+struct HubPut {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    token_clear: bool,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    python: Option<String>,
+    #[serde(default)]
+    dest_dir: Option<String>,
+    #[serde(default)]
+    node: Option<String>,
+}
+
+async fn api_hub_put(State(app): State<App>, Json(req): Json<HubPut>) -> Response {
+    let mut persist = app.persist.lock().await;
+    if req.token_clear {
+        persist.hub.token.clear();
+    } else if let Some(token) = req.token {
+        let t = token.trim();
+        if !t.is_empty() {
+            persist.hub.token = t.to_string();
+        }
+    }
+    if let Some(endpoint) = req.endpoint {
+        persist.hub.endpoint = endpoint.trim().trim_end_matches('/').to_string();
+    }
+    if let Some(python) = req.python {
+        persist.hub.python = python.trim().to_string();
+    }
+    if let Some(dest_dir) = req.dest_dir {
+        persist.hub.dest_dir = dest_dir.trim().to_string();
+    }
+    if let Some(node) = req.node {
+        persist.hub.node = node.trim().to_string();
+    }
+    if let Err(e) = persist.save(&app.cfg.state_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let nodes = app.nodes.lock().await.clone();
+    Json(hub_view(&app.cfg, &persist, &nodes)).into_response()
+}
+
 #[derive(Deserialize)]
 struct PullReq {
     repo: String,
+    #[serde(default)]
+    nodes: Vec<String>,
+    #[serde(default)]
+    dest: Option<String>,
 }
 
 async fn api_pull(State(app): State<App>, Json(req): Json<PullReq>) -> Response {
+    let repo = req.repo.trim().to_string();
+    if repo.is_empty() {
+        return (StatusCode::BAD_REQUEST, "repo is empty").into_response();
+    }
+    let persist = app.persist.lock().await.clone();
+    let views = app.nodes.lock().await.clone();
+    let hub = hub_view(&app.cfg, &persist, &views);
+    let mut names = req.nodes.clone();
+    if names.is_empty() {
+        if hub.node.is_empty() {
+            return (StatusCode::BAD_REQUEST, "没有指定下载机器").into_response();
+        }
+        names.push(hub.node.clone());
+    }
+    names.sort();
+    names.dedup();
+    let dest = req
+        .dest
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(hub.dest_dir.as_str())
+        .to_string();
+    let mut logs = Vec::new();
+    for name in names {
+        let Some(node) = app.cfg.nodes.iter().find(|n| n.name == name) else {
+            logs.push(serde_json::json!({"node": name, "error": "unknown node"}));
+            continue;
+        };
+        let ready = views
+            .iter()
+            .find(|n| n.name == name)
+            .and_then(|n| n.huggingface_hub.as_ref())
+            .is_some();
+        if !ready {
+            logs.push(serde_json::json!({
+                "node": name,
+                "error": "this node has no huggingface_hub in the configured venv",
+            }));
+            continue;
+        }
+        let url = format!("{}/v1/models/pull", app.cfg.agent_url(node));
+        let body = serde_json::json!({
+            "repo": repo,
+            "dest": dest,
+            "token": persist.hub.token,
+            "endpoint": persist.hub.endpoint,
+            "python": hub.python,
+        })
+        .to_string();
+        match agent_call(&app.cfg.token, &url, "POST", Some(&body), 30).await {
+            Ok((status, body)) => {
+                if (200..300).contains(&status) {
+                    if let Ok(job) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(id) = job.get("id").and_then(|x| x.as_str()) {
+                            *app.pull.lock().await = Some(PullView {
+                                id: id.to_string(),
+                                status: job
+                                    .get("status")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("running")
+                                    .to_string(),
+                                node: node.name.clone(),
+                                repo: repo.clone(),
+                                dest: dest.clone(),
+                                log: job
+                                    .get("log")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+                logs.push(serde_json::json!({
+                    "node": node.name,
+                    "status": status,
+                    "body": body,
+                }));
+            }
+            Err(e) => logs.push(serde_json::json!({"node": node.name, "error": e})),
+        }
+    }
+    Json(serde_json::json!({"repo": repo, "dest": dest, "nodes": logs})).into_response()
+}
+
+#[derive(Deserialize)]
+struct DeleteReq {
+    model_id: String,
+}
+
+async fn api_delete(State(app): State<App>, Json(req): Json<DeleteReq>) -> Response {
+    let model_id = req.model_id.trim().to_string();
+    if model_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "model_id is empty").into_response();
+    }
+    {
+        let serving = app.serving.lock().await;
+        let loaded = serving.model_id.as_deref() == Some(model_id.as_str())
+            || serving
+                .model_path
+                .as_ref()
+                .is_some_and(|p| p.contains(&model_id));
+        if loaded && serving.status != "stopped" {
+            drop(serving);
+            let _ = stop_serve(&app).await;
+            let mut p = app.persist.lock().await;
+            p.desired_serving = false;
+            let _ = p.save(&app.cfg.state_path);
+        }
+    }
+    let folder = model_id.replace('/', "--");
     let mut logs = Vec::new();
     for node in &app.cfg.nodes {
-        let url = format!("{}/v1/models/pull", app.cfg.agent_url(node));
-        match agent_call(
-            &app.cfg.token,
-            &url,
-            "POST",
-            Some(&serde_json::json!({"repo": req.repo}).to_string()),
-            30,
-        )
-        .await
-        {
+        let url = format!("{}/v1/models/delete", app.cfg.agent_url(node));
+        let body = serde_json::json!({"model_id": folder}).to_string();
+        match agent_call(&app.cfg.token, &url, "POST", Some(&body), 120).await {
             Ok((status, body)) => logs.push(serde_json::json!({
                 "node": node.name,
                 "status": status,
@@ -550,7 +811,7 @@ async fn api_pull(State(app): State<App>, Json(req): Json<PullReq>) -> Response 
             Err(e) => logs.push(serde_json::json!({"node": node.name, "error": e})),
         }
     }
-    Json(serde_json::json!({"repo": req.repo, "nodes": logs})).into_response()
+    Json(serde_json::json!({"model_id": model_id, "nodes": logs})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -698,6 +959,39 @@ async fn refresh_sync(app: &App) {
     }
 }
 
+async fn refresh_pull(app: &App) {
+    let cur = app.pull.lock().await.clone();
+    let Some(cur) = cur else {
+        return;
+    };
+    if cur.status != "running" {
+        return;
+    }
+    let Some(node) = app.cfg.nodes.iter().find(|n| n.name == cur.node) else {
+        return;
+    };
+    let url = format!("{}/v1/jobs/{}", app.cfg.agent_url(node), cur.id);
+    let Ok((200, body)) = agent_call(&app.cfg.token, &url, "GET", None, 8).await else {
+        return;
+    };
+    let Ok(job) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return;
+    };
+    let mut g = app.pull.lock().await;
+    if let Some(s) = g.as_mut() {
+        if s.id == cur.id {
+            s.status = job
+                .get("status")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&s.status)
+                .to_string();
+            if let Some(log) = job.get("log").and_then(|x| x.as_str()) {
+                s.log = log.to_string();
+            }
+        }
+    }
+}
+
 async fn api_endpoints(State(app): State<App>) -> Json<EndpointView> {
     let persist = app.persist.lock().await;
     let ep = persist
@@ -723,7 +1017,28 @@ async fn api_endpoints_put(State(app): State<App>, Json(ep): Json<EndpointConfig
 async fn api_logs(State(app): State<App>) -> Json<serde_json::Value> {
     let serve = serve::tail_log(&app.cfg.log_dir.join("serve.log"), 80_000);
     let sync = app.sync.lock().await.clone();
-    Json(serde_json::json!({ "serve": serve, "sync": sync }))
+    let pull = app.pull.lock().await.clone();
+    Json(serde_json::json!({ "serve": serve, "sync": sync, "pull": pull }))
+}
+
+async fn api_logs_clear(State(app): State<App>) -> Json<serde_json::Value> {
+    let path = app.cfg.log_dir.join("serve.log");
+    if let Err(e) = serve::clear_log(&path) {
+        return Json(serde_json::json!({ "ok": false, "error": e.to_string() }));
+    }
+    {
+        let mut sync = app.sync.lock().await;
+        if sync.as_ref().map(|s| s.status.as_str()) != Some("running") {
+            *sync = None;
+        }
+    }
+    {
+        let mut pull = app.pull.lock().await;
+        if pull.as_ref().map(|p| p.status.as_str()) != Some("running") {
+            *pull = None;
+        }
+    }
+    Json(serde_json::json!({ "ok": true }))
 }
 
 async fn api_infer_chat(State(app): State<App>, req: Request<Body>) -> Response {
@@ -809,16 +1124,20 @@ async fn gather_models(app: &App) -> Vec<LocalModel> {
                 complete: m.complete,
                 size_bytes: m.size_bytes,
                 path: m.path.clone(),
+                downloading: m.downloading,
             };
             by_id
                 .entry(m.id.clone())
                 .and_modify(|acc| {
                     acc.replicas.push(replica.clone());
+                    acc.downloading = acc.downloading || replica.downloading;
+                    if replica.size_bytes > acc.size_bytes {
+                        acc.size_bytes = replica.size_bytes;
+                    }
                     if replica.complete
-                        && (replica.size_bytes > acc.size_bytes || !acc.complete)
+                        && (replica.size_bytes >= acc.size_bytes || !acc.complete)
                     {
                         acc.complete = true;
-                        acc.size_bytes = replica.size_bytes;
                         acc.path = replica.path.clone();
                         acc.kind = m.kind.clone();
                         acc.architecture = m.architecture.clone();
@@ -852,10 +1171,12 @@ async fn gather_models(app: &App) -> Vec<LocalModel> {
                     complete: false,
                     size_bytes: 0,
                     path: String::new(),
+                    downloading: false,
                 });
             }
         }
         m.replicas.sort_by(|a, b| a.node.cmp(&b.node));
+        m.downloading = m.replicas.iter().any(|r| r.downloading);
         m.cluster_complete = expected.iter().all(|name| {
             m.replicas
                 .iter()
@@ -902,6 +1223,10 @@ async fn start_serve(
     profile: Option<ServeProfile>,
 ) -> Result<(), String> {
     let _ = stop_serve(app).await;
+    let port = app.cfg.internal_infer_port;
+    if let Err(e) = serve::wait_port_free(port, Duration::from_secs(20)).await {
+        return Err(format!("旧模型还没退出：{e}"));
+    }
     {
         let mut s = app.serving.lock().await;
         s.status = "starting".into();
@@ -926,10 +1251,9 @@ async fn start_serve(
         p.launch_pid = Some(pid);
         let _ = p.save(&app.cfg.state_path);
     }
-    let port = app.cfg.internal_infer_port;
     let serving = app.serving.clone();
     tokio::spawn(async move {
-        match serve::wait_ready(port, Duration::from_secs(900)).await {
+        match serve::wait_ready(port, Duration::from_secs(2700), Some(pid)).await {
             Ok(()) => {
                 let mut s = serving.lock().await;
                 if s.pid == Some(pid) {

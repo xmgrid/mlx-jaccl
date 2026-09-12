@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MLX-JACCL 控制台</title>
-  <link rel="stylesheet" href="/styles.css?v=sync" />
+  <link rel="stylesheet" href="/styles.css?v=swap3" />
 </head>
 <body>
   <header class="top">
@@ -14,6 +14,7 @@
     </div>
     <div class="top-status">
       <span class="pill" id="serve-pill">stopped</span>
+      <button type="button" class="danger" id="btn-unload" hidden>卸下</button>
       <button type="button" class="ghost" id="copy-url">复制 OpenAI</button>
       <button type="button" class="ghost" id="copy-claude">复制 Claude</button>
     </div>
@@ -39,14 +40,44 @@
     </section>
 
     <section id="tab-models" class="panel">
+      <form id="hub-form" class="form hub-form">
+        <label>HF Token
+          <input name="token" type="password" autocomplete="off" placeholder="已保存则留空不改" />
+        </label>
+        <label>国内镜像 / Endpoint
+          <input name="endpoint" list="hub-mirrors" spellcheck="false" placeholder="留空=官方 huggingface.co" />
+          <datalist id="hub-mirrors">
+            <option value="https://hf-mirror.com">hf-mirror.com</option>
+            <option value="https://huggingface.co">官方</option>
+          </datalist>
+        </label>
+        <label>下载目录
+          <input name="dest_dir" spellcheck="false" placeholder="/Users/USER/.exo/models" />
+        </label>
+        <label>默认 venv / Python
+          <input name="python" spellcheck="false" placeholder="/Users/USER/mlx-env/bin/python" />
+        </label>
+        <label>下载机器（需已装 huggingface_hub）
+          <select name="node" id="hub-node"></select>
+        </label>
+        <label class="check hub-clear">
+          <input name="token_clear" type="checkbox" />
+          清除已保存 Token
+        </label>
+        <button type="submit">保存 Hub 设置</button>
+      </form>
       <div class="toolbar">
         <input id="pull-repo" placeholder="mlx-community/Qwen3.5-27B-4bit" />
-        <button type="button" id="btn-pull">四台拉取</button>
-        <p class="hint" id="model-hint">一台下完后点「同步到四台」，经 Thunderbolt 复制到其余三台。四台都完整才能加载。</p>
+        <label class="pull-node-label">拉取到
+          <select id="pull-node" title="只下一台，下完再同步到四台"></select>
+        </label>
+        <button type="button" id="btn-pull">拉取</button>
+        <button type="button" class="danger" id="btn-model-unload" hidden>卸下当前模型</button>
+        <p class="hint" id="model-hint">先保存 HF Token / 镜像，选一台已装 huggingface_hub 的机器下载，下完再「同步到四台」。四台都完整才能加载。</p>
         <button type="button" id="btn-install-vlm" hidden>安装 mlx-vlm</button>
       </div>
       <div class="toolbar pull-row">
-        <span class="meta">快捷拉取</span>
+        <span class="meta">快捷拉取 · 拉到所选机器</span>
         <button type="button" class="pull-chip" data-repo="mlx-community/Qwen3.8-Flash-Next-4bit">Qwen3.8-Flash-Next-4bit</button>
         <button type="button" class="pull-chip" data-repo="mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed">DeepSeek-V4-Flash-0731-2.4bit-mixed</button>
       </div>
@@ -59,6 +90,7 @@
             <th>分布</th>
             <th>说明</th>
             <th>启动</th>
+            <th></th>
           </tr>
         </thead>
         <tbody id="model-rows"></tbody>
@@ -134,11 +166,15 @@
     </section>
 
     <section id="tab-logs" class="panel">
+      <div class="toolbar">
+        <button type="button" class="danger" id="btn-clear-logs">清除日志</button>
+        <p class="hint">清空推理日志。正在下载或同步的进度会留着。</p>
+      </div>
       <pre class="log" id="log-box">暂无日志</pre>
     </section>
   </main>
 
   <p class="flash" id="flash" hidden></p>
-  <script type="module" src="/app.js?v=sync"></script>
+  <script type="module" src="/app.js?v=logs1"></script>
 </body>
 </html>
